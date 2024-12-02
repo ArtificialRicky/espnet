@@ -188,6 +188,41 @@ class ResidualAttentionBlock(nn.Module):
         return x
 
 
+
+
+class ConvModule(nn.Module):
+    """
+    Conformer-like convolution module.
+    """
+    def __init__(self, n_state: int, kernel_size: int = 31, dropout: float = 0.1):
+        super().__init__()
+        self.pointwise_conv1 = nn.Conv1d(
+            n_state, n_state * 2, kernel_size=1, stride=1, padding=0, bias=True
+        )
+        self.glu = nn.GLU(dim=1)
+        self.depthwise_conv = nn.Conv1d(
+            n_state, n_state, kernel_size=kernel_size, stride=1, padding=kernel_size // 2, groups=n_state, bias=True
+        )
+        self.batch_norm = nn.BatchNorm1d(n_state)
+        self.pointwise_conv2 = nn.Conv1d(
+            n_state, n_state, kernel_size=1, stride=1, padding=0, bias=True
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.activation = nn.SiLU()
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Input shape: (batch, seq_len, n_state)
+        x = x.transpose(1, 2)  # Change to (batch, n_state, seq_len)
+        x = self.pointwise_conv1(x)
+        x = self.glu(x)
+        x = self.depthwise_conv(x)
+        x = self.batch_norm(x)
+        x = self.activation(x)
+        x = self.pointwise_conv2(x)
+        x = self.dropout(x)
+        return x.transpose(1, 2)  # Back to (batch, seq_len, n_state)
+
+
 class TransformerDecoder(AbsTransformer):
     def __init__(
         self,
@@ -198,7 +233,8 @@ class TransformerDecoder(AbsTransformer):
         n_layer: int = 4,
         causal: bool = True,
         qk_norm: bool = False,
-        dropout: float = 0.0,
+        dropout: float = 0.1,
+        conv_kernel_size: int = 31,
         layer_class=ResidualAttentionBlock,
     ):
         super().__init__()
@@ -207,18 +243,25 @@ class TransformerDecoder(AbsTransformer):
 
         self.blocks = nn.ModuleList(
             [
-                layer_class(
-                    n_state=n_state,
-                    n_head=n_head,
-                    cross_attention=False,
-                    causal=causal,
-                    qk_norm=qk_norm,
-                    dropout=dropout,
+                nn.ModuleDict(
+                    {
+                        "attention": layer_class(
+                            n_state=n_state,
+                            n_head=n_head,
+                            cross_attention=False,
+                            causal=causal,
+                            qk_norm=qk_norm,
+                            dropout=dropout,
+                        ),
+                        "conv": ConvModule(n_state, kernel_size=conv_kernel_size, dropout=dropout),
+                        "ln": LayerNorm(n_state),
+                    }
                 )
                 for _ in range(n_layer)
             ]
         )
-        self.ln = LayerNorm(n_state)
+
+        self.final_ln = LayerNorm(n_state)
 
         self.causal = causal
         self.d_model = n_state
@@ -227,22 +270,28 @@ class TransformerDecoder(AbsTransformer):
         self.kv_cache = None
         self.hooks = None
 
-    def forward(self, x: Tensor, mask: torch.Tensor = None):
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None):
         if self.causal and mask is not None:
-            raise ValueError("Causal Transformer dones't allow mask")
+            raise ValueError("Causal Transformer doesn't allow mask")
 
         offset = next(iter(self.kv_cache.values())).shape[1] if self.kv_cache else 0
         x = x + self.pos_emb.weight[offset : offset + x.shape[1]].unsqueeze(0)
 
         for block in self.blocks:
-            x = block(x, mask=mask, kv_cache=self.kv_cache)
+            # Attention block
+            x = block["attention"](x, mask=mask, kv_cache=self.kv_cache)
 
-        x = self.ln(x)
+            # Convolution module
+            residual = x
+            x = block["conv"](x)
+            x = block["ln"](x + residual)  # Add & Norm
+
+        x = self.final_ln(x)
         return x
-    
+
     def init(self):
         self.kv_cache, self.hooks = install_kv_cache_hook(
-            self.blocks, 
+            [block["attention"] for block in self.blocks], 
             self.kv_cache,
             attn_module=MultiHeadAttention,
         )
@@ -263,4 +312,3 @@ class TransformerDecoder(AbsTransformer):
     @property
     def n_ctx(self):
         return self._n_ctx
-        

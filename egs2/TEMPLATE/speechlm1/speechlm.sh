@@ -76,7 +76,7 @@ inference_config="" # Config for decoding.
 inference_args=""   # Arguments for decoding (e.g., "--threshold 0.75").
                     # Note that it will overwrite args in inference config.
 inference_tag=""    # Suffix for decoding directory.
-inference_model=valid.acc.ave.pth # Model path for decoding.
+inference_model=valid.total_count.best.pth # Model path for decoding.
                                    # e.g.
                                    # inference_model=train.loss.best.pth
                                    # inference_model=3epoch.pth
