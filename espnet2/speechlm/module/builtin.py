@@ -127,6 +127,52 @@ class MultiHeadAttention(nn.Module):
         return wv
 
 
+class ConvolutionModule(nn.Module):
+    """ConvolutionModule in Conformer model."""
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 31,
+        activation: nn.Module = nn.GELU(),
+        dropout: float = 0.0,
+    ):
+        """Construct a ConvolutionModule."""
+        super().__init__()
+        self.pointwise_conv1 = nn.Conv1d(channels, 2 * channels, kernel_size=1, padding=0)
+        self.depthwise_conv = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            padding=(kernel_size - 1) // 2,
+            groups=channels,
+        )
+        self.batch_norm = nn.BatchNorm1d(channels)
+        self.activation = activation
+        self.pointwise_conv2 = nn.Conv1d(channels, channels, kernel_size=1, padding=0)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Compute convolution module.
+
+        Args:
+            x (Tensor): Input tensor (#batch, time, channels).
+
+        Returns:
+            Tensor: Output tensor (#batch, time, channels).
+        """
+        x = x.transpose(1, 2)  # (#batch, channels, time)
+        x = self.pointwise_conv1(x)
+        x = F.glu(x, dim=1)
+        x = self.depthwise_conv(x)
+        x = self.batch_norm(x)
+        x = self.activation(x)
+        x = self.pointwise_conv2(x)
+        x = x.transpose(1, 2)
+        x = self.dropout(x)
+        return x
+
+
 class ResidualAttentionBlock(nn.Module):
     def __init__(
         self,
@@ -134,10 +180,16 @@ class ResidualAttentionBlock(nn.Module):
         n_head: int,
         cross_attention: bool = False,
         causal: bool = False,
-        qk_norm: bool = False,
+        qk_norm: bool = True,
         dropout: float = 0.0,
+        macaron_style: bool = True,
+        use_cnn_module: bool = True,
+        cnn_module_kernel: int = 31,
     ):
         super().__init__()
+
+        self.macaron_style = macaron_style
+        self.use_cnn_module = use_cnn_module
 
         self.attn = MultiHeadAttention(
             n_state,
@@ -149,26 +201,49 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_ln = LayerNorm(n_state)
         self.attn_dropout = nn.Dropout(p=dropout)
 
-        self.cross_attn = (
-            MultiHeadAttention(
+        if cross_attention:
+            self.cross_attn = MultiHeadAttention(
                 n_state,
                 n_head,
                 causal=False,
                 qk_norm=qk_norm,
                 dropout=dropout,
             )
-            if cross_attention
-            else None
-        )
-        self.cross_attn_ln = LayerNorm(n_state) if cross_attention else None
-        self.cross_attn_dropout = nn.Dropout(p=dropout) if cross_attention else None
+            self.cross_attn_ln = LayerNorm(n_state)
+            self.cross_attn_dropout = nn.Dropout(p=dropout)
+        else:
+            self.cross_attn = None
 
-        n_mlp = n_state * 4
         self.mlp = nn.Sequential(
-            Linear(n_state, n_mlp), nn.GELU(), Linear(n_mlp, n_state)
+            Linear(n_state, n_state * 4),
+            nn.GELU(),
+            Linear(n_state * 4, n_state),
         )
         self.mlp_ln = LayerNorm(n_state)
         self.mlp_dropout = nn.Dropout(p=dropout)
+
+        if macaron_style:
+            self.mlp_macaron = nn.Sequential(
+                Linear(n_state, n_state * 4),
+                nn.GELU(),
+                Linear(n_state * 4, n_state),
+            )
+            self.mlp_macaron_ln = LayerNorm(n_state)
+            self.mlp_macaron_dropout = nn.Dropout(p=dropout)
+        else:
+            self.mlp_macaron = None
+
+        if use_cnn_module:
+            self.conv_module = ConvolutionModule(
+                n_state,
+                kernel_size=cnn_module_kernel,
+                activation=nn.GELU(),
+                dropout=dropout,
+            )
+            self.conv_ln = LayerNorm(n_state)
+            self.conv_dropout = nn.Dropout(p=dropout)
+        else:
+            self.conv_module = None
 
     def forward(
         self,
@@ -177,50 +252,36 @@ class ResidualAttentionBlock(nn.Module):
         mask: Optional[Tensor] = None,
         kv_cache: Optional[dict] = None,
     ):
-        x = x + self.attn_dropout(
-            self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)
-        )
-        if self.cross_attn:
-            x = x + self.cross_attn_dropout(
-                self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)
-            )
-        x = x + self.mlp_dropout(self.mlp(self.mlp_ln(x)))
+        residual = x
+
+        if self.macaron_style and self.mlp_macaron is not None:
+            x = self.mlp_macaron_ln(x)
+            x = residual + 0.5 * self.mlp_macaron_dropout(self.mlp_macaron(x))
+            residual = x  # Update residual
+        
+        # if self.conv_module is not None: # cnn before 
+        #     x = self.conv_ln(x)
+        #     x = residual + self.conv_dropout(self.conv_module(x))
+        #     residual = x
+
+        x = self.attn_ln(x)
+        x = residual + self.attn_dropout(self.attn(x, mask=mask, kv_cache=kv_cache))
+        residual = x
+
+        if self.cross_attn is not None and xa is not None:
+            x = self.cross_attn_ln(x)
+            x = residual + self.cross_attn_dropout(self.cross_attn(x, xa, kv_cache=kv_cache))
+            residual = x
+
+        if self.conv_module is not None: # cnn after attention
+            x = self.conv_ln(x)
+            x = residual + self.conv_dropout(self.conv_module(x))
+            residual = x
+
+        x = self.mlp_ln(x)
+        x = residual + 0.5 * self.mlp_dropout(self.mlp(x))  # FFN 输出缩放
+
         return x
-
-
-
-
-class ConvModule(nn.Module):
-    """
-    Conformer-like convolution module.
-    """
-    def __init__(self, n_state: int, kernel_size: int = 31, dropout: float = 0.1):
-        super().__init__()
-        self.pointwise_conv1 = nn.Conv1d(
-            n_state, n_state * 2, kernel_size=1, stride=1, padding=0, bias=True
-        )
-        self.glu = nn.GLU(dim=1)
-        self.depthwise_conv = nn.Conv1d(
-            n_state, n_state, kernel_size=kernel_size, stride=1, padding=kernel_size // 2, groups=n_state, bias=True
-        )
-        self.batch_norm = nn.BatchNorm1d(n_state)
-        self.pointwise_conv2 = nn.Conv1d(
-            n_state, n_state, kernel_size=1, stride=1, padding=0, bias=True
-        )
-        self.dropout = nn.Dropout(dropout)
-        self.activation = nn.SiLU()
-
-    def forward(self, x: Tensor) -> Tensor:
-        # Input shape: (batch, seq_len, n_state)
-        x = x.transpose(1, 2)  # Change to (batch, n_state, seq_len)
-        x = self.pointwise_conv1(x)
-        x = self.glu(x)
-        x = self.depthwise_conv(x)
-        x = self.batch_norm(x)
-        x = self.activation(x)
-        x = self.pointwise_conv2(x)
-        x = self.dropout(x)
-        return x.transpose(1, 2)  # Back to (batch, seq_len, n_state)
 
 
 class TransformerDecoder(AbsTransformer):
@@ -232,9 +293,13 @@ class TransformerDecoder(AbsTransformer):
         n_head: int = 4,
         n_layer: int = 4,
         causal: bool = True,
-        qk_norm: bool = False,
-        dropout: float = 0.1,
-        conv_kernel_size: int = 31,
+        qk_norm: bool = True,
+        dropout: float = 0.0,
+        positionwise_layer_type: str = "linear",
+        positionwise_conv_kernel_size: int = 31,
+        macaron_style: bool = True,
+        use_cnn_module: bool = True,
+        cnn_module_kernel: int = 31,
         layer_class=ResidualAttentionBlock,
     ):
         super().__init__()
@@ -243,34 +308,30 @@ class TransformerDecoder(AbsTransformer):
 
         self.blocks = nn.ModuleList(
             [
-                nn.ModuleDict(
-                    {
-                        "attention": layer_class(
-                            n_state=n_state,
-                            n_head=n_head,
-                            cross_attention=False,
-                            causal=causal,
-                            qk_norm=qk_norm,
-                            dropout=dropout,
-                        ),
-                        "conv": ConvModule(n_state, kernel_size=conv_kernel_size, dropout=dropout),
-                        "ln": LayerNorm(n_state),
-                    }
+                layer_class(
+                    n_state=n_state,
+                    n_head=n_head,
+                    cross_attention=False,
+                    causal=causal,
+                    qk_norm=qk_norm,
+                    dropout=dropout,
+                    macaron_style=macaron_style,
+                    use_cnn_module=use_cnn_module,
+                    cnn_module_kernel=cnn_module_kernel,
                 )
                 for _ in range(n_layer)
             ]
         )
-
-        self.final_ln = LayerNorm(n_state)
+        self.ln = LayerNorm(n_state)
 
         self.causal = causal
         self.d_model = n_state
         self._n_ctx = n_ctx
-        
+
         self.kv_cache = None
         self.hooks = None
 
-    def forward(self, x: Tensor, mask: Optional[Tensor] = None):
+    def forward(self, x: Tensor, mask: torch.Tensor = None):
         if self.causal and mask is not None:
             raise ValueError("Causal Transformer doesn't allow mask")
 
@@ -278,20 +339,14 @@ class TransformerDecoder(AbsTransformer):
         x = x + self.pos_emb.weight[offset : offset + x.shape[1]].unsqueeze(0)
 
         for block in self.blocks:
-            # Attention block
-            x = block["attention"](x, mask=mask, kv_cache=self.kv_cache)
+            x = block(x, mask=mask, kv_cache=self.kv_cache)
 
-            # Convolution module
-            residual = x
-            x = block["conv"](x)
-            x = block["ln"](x + residual)  # Add & Norm
-
-        x = self.final_ln(x)
+        x = self.ln(x)
         return x
 
     def init(self):
         self.kv_cache, self.hooks = install_kv_cache_hook(
-            [block["attention"] for block in self.blocks], 
+            self.blocks,
             self.kv_cache,
             attn_module=MultiHeadAttention,
         )
@@ -301,14 +356,14 @@ class TransformerDecoder(AbsTransformer):
             h.remove()
         self.kv_cache = None
         self.hooks = None
-    
+
     def select_state(self, index):
         if self.kv_cache is None:
             raise ValueError("Transformer is not initialized or doesn't have kv_cache")
-        
+
         for k, v in self.kv_cache.items():
             self.kv_cache[k] = v[index]
-    
+
     @property
     def n_ctx(self):
         return self._n_ctx
